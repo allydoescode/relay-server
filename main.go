@@ -114,14 +114,14 @@ func main() {
 			receiverAddr := peer.addr
 
 			b := fmt.Appendf(nil, "REQUEST %s %s", receiverId, receiverAddr.String())
-			_, err = conn.WriteToUDP(b, receiverAddr)
+			_, err = conn.WriteToUDP(b, senderAddr)
 			if err != nil {
 				log.Printf("[udp] error writing to %s: %v\n", receiverAddr.String(), err)
 				return
 			}
 
 			b = fmt.Appendf(nil, "REQUEST %s %s", senderId, senderAddr.String())
-			_, err = conn.WriteToUDP(b, senderAddr)
+			_, err = conn.WriteToUDP(b, receiverAddr)
 			if err != nil {
 				log.Printf("[udp] error writing to %s: %v\n", senderAddr.String(), err)
 				return
