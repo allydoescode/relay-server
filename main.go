@@ -55,6 +55,18 @@ func main() {
 			continue
 		}
 
+		s.SetNoDelay(1, 10, 2, 1)
+		s.SetWindowSize(128, 128)
+
+		go handleClient(s)
+
+	}
+}
+
+func handleClient(s *kcp.UDPSession) {
+	defer s.Close()
+
+	for {
 		// n, raddr, err := conn.ReadFromUDP(buf)
 		buf, err := Read(s)
 		if err != nil {
@@ -197,7 +209,6 @@ func main() {
 		default:
 			log.Printf("[udp] unrecognized command parameter %s from %s in: %s\n", params[0], s.RemoteAddr().String(), msg)
 		}
-
 	}
 }
 
