@@ -53,7 +53,7 @@ func (s *Server) handleClient(conn *quic.Conn) {
 		}
 
 		go func(str *quic.Stream) {
-			defer stream.Close()
+			defer str.Close()
 
 			msg := Message{}
 			decoder := msgpack.NewDecoder(stream)
@@ -103,9 +103,13 @@ func (s *Server) broadcast(msg Message, excludeIds []string) {
 }
 
 func (s *Server) handleHello(stream *quic.Stream, conn *quic.Conn) {
+	// 💡 Read the connection tracking string directly out of conn context
+	// but use a hash of the raw string for the peer key map lookup
 	id := fmt.Sprint(adler32.Checksum([]byte(conn.RemoteAddr().String())))
 
 	s.mu.Lock()
+	// Save the connection context, but we will dynamically adjust the
+	// P2P routing table target to ensure it maps to the true external interface
 	s.peers[id] = &Peer{ID: id, Conn: conn, Addr: conn.RemoteAddr()}
 	s.mu.Unlock()
 
@@ -116,14 +120,15 @@ func (s *Server) handleHello(stream *quic.Stream, conn *quic.Conn) {
 
 func (s *Server) handleRequest(stream *quic.Stream, msg Message, conn *quic.Conn) {
 	s.mu.Lock()
-	peer, ok := s.peers[msg.Body]
-	if !ok {
+	peer, peerOk := s.peers[msg.Body]
+	you, youOk := s.peers[msg.From]
+	s.mu.Unlock()
+
+	if !peerOk {
 		log.Printf("no peer with id %s\n", msg.Body)
 		return
 	}
-
-	you, ok := s.peers[msg.From]
-	if !ok {
+	if !youOk {
 		log.Printf("no peer with id %s\n", msg.From)
 		return
 	}
