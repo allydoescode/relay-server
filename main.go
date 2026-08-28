@@ -1,234 +1,165 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"hash/adler32"
 	"log"
-	"net"
-	"net/http"
-	"strconv"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/xtaci/kcp-go/v5"
+	"github.com/quic-go/quic-go"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-type Peer struct {
-	id    string
-	addr  *net.UDPAddr
-	conn  *kcp.UDPSession
-	timer *time.Timer
+type Server struct {
+	ID    string
+	peers map[string]*Peer
+	mu    sync.Mutex
 }
 
-var (
-	peers = make(map[string]*Peer)
-)
-
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {})
-	go http.ListenAndServe(":3000", nil)
-
-	// laddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:12345")
-	// if err != nil {
-	// 	log.Fatalf("error resolve local addr: %v\n", err)
-	// }
-
-	ln, err := kcp.ListenWithOptions("0.0.0.0:12345", nil, 10, 3)
+	ln, err := quic.ListenAddr("0.0.0.0:12345", GenerateTLSConfig(), &quic.Config{
+		MaxIdleTimeout: 2 * time.Hour,
+	})
 	if err != nil {
 		log.Fatal(err)
-		return
 	}
 	defer ln.Close()
 
-	// conn, err := net.ListenUDP("udp", laddr)
-	// if err != nil {
-	// 	log.Fatalf("error listen udp: %v\n", err)
-	// }
-	// defer conn.Close()
+	server := Server{peers: make(map[string]*Peer)}
+	for {
+		conn, err := ln.Accept(context.Background())
+		if err != nil {
+			log.Printf("quic accept error: %v\n", err)
+			continue
+		}
 
-	// log.Printf("listening on %s\n", conn.LocalAddr())
+		go server.handleClient(conn)
+	}
+}
+
+func (s *Server) handleClient(conn *quic.Conn) {
+	defer conn.CloseWithError(0, "Connection closed")
+	clientAddrStr := conn.RemoteAddr().String()
 
 	for {
-		s, err := ln.AcceptKCP()
+		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("accept kcp error: %v\n", err)
-			continue
+			log.Printf("quic stream accept error: %v\n", err)
+			return
 		}
 
-		s.SetNoDelay(1, 10, 2, 1)
-		s.SetWindowSize(128, 128)
+		go func(str *quic.Stream) {
+			defer stream.Close()
 
-		go handleClient(s)
+			msg := Message{}
+			decoder := msgpack.NewDecoder(stream)
+			if err := decoder.Decode(&msg); err != nil {
+				log.Printf("msgpack decode error: %v\n", err)
+				return
+			}
 
+			log.Printf("%s sent: %v\n", clientAddrStr, msg)
+
+			switch msg.Type {
+			case "hello":
+				s.handleHello(str, conn)
+			case "request":
+				s.handleRequest(str, msg, conn)
+			case "goodbye": // 💡 ADD THIS CASE TO YOUR SERVER
+				s.mu.Lock()
+				delete(s.peers, msg.From) // Instantly clear the client from active pools
+				s.mu.Unlock()
+
+				s.broadcast(Message{From: "SERVER", To: "ALL", Type: "leave", Body: msg.From}, []string{})
+			}
+
+		}(stream)
 	}
 }
 
-func handleClient(s *kcp.UDPSession) {
-	defer s.Close()
+func (s *Server) broadcast(msg Message, excludeIds []string) {
+	s.mu.Lock()
+	for peerId, peer := range s.peers {
+		if slices.Contains(excludeIds, peerId) {
+			continue
+		}
 
-	for {
-		// n, raddr, err := conn.ReadFromUDP(buf)
-		buf, err := Read(s)
+		go func(pc *quic.Conn) {
+			pStream, err := pc.OpenStream()
+			if err != nil {
+				log.Printf("quic open stream error: %v\n", err)
+				return
+			}
+
+			defer pStream.Close()
+			_ = msgpack.NewEncoder(pStream).Encode(msg)
+		}(peer.Conn)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) handleHello(stream *quic.Stream, conn *quic.Conn) {
+	id := fmt.Sprint(adler32.Checksum([]byte(conn.RemoteAddr().String())))
+
+	s.mu.Lock()
+	s.peers[id] = &Peer{ID: id, Conn: conn, Addr: conn.RemoteAddr()}
+	s.mu.Unlock()
+
+	encoder := msgpack.NewEncoder(stream)
+	_ = encoder.Encode(Message{From: "SERVER", Type: "hello_ack", Body: id})
+	s.broadcast(Message{From: "SERVER", To: "ALL", Type: "join", Body: id}, []string{id})
+}
+
+func (s *Server) handleRequest(stream *quic.Stream, msg Message, conn *quic.Conn) {
+	s.mu.Lock()
+	peer, ok := s.peers[msg.Body]
+	s.mu.Unlock()
+
+	if !ok {
+		_ = msgpack.NewEncoder(stream).Encode(Message{From: "SERVER", To: msg.From, Type: "error", Body: "peer not found"})
+		return
+	}
+
+	// 1. Reply to the requesting client who called this function
+	encoder := msgpack.NewEncoder(stream)
+	if err := encoder.Encode(Message{
+		From: "SERVER",
+		To:   msg.From,
+		Type: "request_ack",
+		Body: strings.Join([]string{peer.ID, peer.Conn.RemoteAddr().String()}, " "),
+	}); err != nil {
+		log.Printf("Failed sending request_ack to sender: %v", err)
+	}
+
+	s.mu.Lock()
+	you, _ := s.peers[msg.From]
+	s.mu.Unlock()
+
+	// 2. Alert the target peer asynchronously
+	go func() {
+		pStream, err := peer.Conn.OpenStream()
 		if err != nil {
-			log.Printf("error read udp for %s: %v\n", s.RemoteAddr().String(), err)
-			continue
+			log.Printf("Failed to open stream to target peer: %v", err)
+			return
+		}
+		// 💡 IMPORTANT: Using a separate scoped block ensures encoding
+		// happens completely before the stream defer closes.
+		enc := msgpack.NewEncoder(pStream)
+		err = enc.Encode(Message{
+			From: "SERVER",
+			To:   peer.ID,
+			Type: "request_ack",
+			Body: strings.Join([]string{you.ID, conn.RemoteAddr().String()}, " "),
+		})
+		if err != nil {
+			log.Printf("Failed writing target info over stream: %v", err)
 		}
 
-		msg := string(buf)
-
-		params := strings.Split(msg, " ")
-		switch params[0] {
-
-		case "HELLO":
-			remoteId := fmt.Sprint(adler32.Checksum([]byte(s.RemoteAddr().String())))
-
-			b := fmt.Appendf(nil, "HELLO %s", remoteId)
-			// _, err = conn.WriteToUDP(b, raddr)
-			err = Write(s, b)
-			if err != nil {
-				log.Printf("[udp] error writing to %s: %v\n", s.RemoteAddr().String(), err)
-				continue
-			}
-
-			raddr, err := net.ResolveUDPAddr("udp", s.RemoteAddr().String())
-			if err != nil {
-				log.Printf("[udp] error resolving addr %s: %v\n", s.RemoteAddr().String(), err)
-				continue
-			}
-
-			peer := &Peer{
-				id:    remoteId,
-				addr:  raddr,
-				conn:  s,
-				timer: time.NewTimer(10 * time.Second),
-			}
-			peers[remoteId] = peer
-
-			go func() {
-				for range peer.timer.C {
-					log.Printf("[udp] %s timed out, removing...\n", peer.id)
-					delete(peers, peer.id)
-
-					for id, peer := range peers {
-						b := fmt.Appendf(nil, "LEAVE %s", peer.id)
-						// _, err = conn.WriteToUDP(b, peer.addr)
-						err = Write(peer.conn, b)
-						if err != nil {
-							log.Printf("[udp] error writing to %s: %v\n", id, err)
-							continue
-						}
-					}
-
-					return
-				}
-			}()
-
-			for id, peer := range peers {
-				if id == remoteId {
-					continue
-				}
-
-				b := fmt.Appendf(nil, "JOIN %s", remoteId)
-				// _, err = conn.WriteToUDP(b, peer.addr)
-				err = Write(peer.conn, b)
-				if err != nil {
-					log.Printf("[udp] error writing to %s: %v\n", id, err)
-					continue
-				}
-			}
-
-			continue
-
-		case "REQUEST":
-			senderId := params[1]
-			receiverId := params[2]
-
-			you, ok := peers[senderId]
-			if !ok {
-				log.Printf("[udp] unknown id %s in request, ignoring...\n", senderId)
-			}
-			senderAddr := you.addr
-
-			peer, ok := peers[receiverId]
-			if !ok {
-				log.Printf("[udp] unknown id %s in request, ignoring...", receiverId)
-				continue
-			}
-			receiverAddr := peer.addr
-
-			b := fmt.Appendf(nil, "REQUEST %s %s", receiverId, receiverAddr.String())
-			// _, err = conn.WriteToUDP(b, senderAddr)
-			err = Write(peer.conn, b)
-			if err != nil {
-				log.Printf("[udp] error writing to %s: %v\n", receiverAddr.String(), err)
-				return
-			}
-
-			b = fmt.Appendf(nil, "REQUEST %s %s", senderId, senderAddr.String())
-			// _, err = conn.WriteToUDP(b, receiverAddr)
-			err = Write(peer.conn, b)
-			if err != nil {
-				log.Printf("[udp] error writing to %s: %v\n", senderAddr.String(), err)
-				return
-			}
-
-			log.Printf("[udp] request process completed for %s and %s\n", senderId, receiverId)
-			continue
-
-		case "PING":
-			senderId := params[1]
-			senderTime, _ := strconv.ParseInt(params[3], 10, 64)
-
-			peer, ok := peers[senderId]
-			if !ok {
-				log.Printf("[udp] peer %s already timed out\n", senderId)
-				// _, err = conn.WriteToUDP([]byte("BAD"), raddr)
-				err = Write(peer.conn, []byte("BAD"))
-				continue
-			}
-
-			peer.timer.Reset(10 * time.Second)
-
-			now := time.Now().UnixMilli()
-			b := fmt.Appendf(nil, "PONG SERVER %s %d %d", senderId, now-senderTime, now)
-			// _, err := conn.WriteToUDP(b, raddr)
-			err = Write(peer.conn, b)
-			if err != nil {
-				log.Printf("[udp] error write to udp: %v\n", err)
-				return
-			}
-
-		case "PONG":
-			senderId := params[1]
-			senderMs, _ := strconv.ParseInt(params[3], 10, 64)
-			senderTime, _ := strconv.ParseInt(params[4], 10, 64)
-
-			now := time.Now().UnixMilli()
-			log.Printf("RTT %s: %dms %dms (%d)\n", senderId, senderMs, now-senderTime, senderMs+(now-senderTime))
-
-		default:
-			log.Printf("[udp] unrecognized command parameter %s from %s in: %s\n", params[0], s.RemoteAddr().String(), msg)
-		}
-	}
-}
-
-func Write(conn *kcp.UDPSession, b []byte) error {
-	_, err := conn.Write(b)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("write %s: %s", conn.RemoteAddr().String(), string(b))
-	return nil
-}
-
-func Read(conn *kcp.UDPSession) ([]byte, error) {
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("read  %s: %s", conn.RemoteAddr().String(), string(buf[:n]))
-	return buf[:n], nil
+		// Let QUIC finish sending data chunks before destroying the stream
+		pStream.Close()
+	}()
 }
