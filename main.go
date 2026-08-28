@@ -117,49 +117,52 @@ func (s *Server) handleHello(stream *quic.Stream, conn *quic.Conn) {
 func (s *Server) handleRequest(stream *quic.Stream, msg Message, conn *quic.Conn) {
 	s.mu.Lock()
 	peer, ok := s.peers[msg.Body]
-	s.mu.Unlock()
-
 	if !ok {
-		_ = msgpack.NewEncoder(stream).Encode(Message{From: "SERVER", To: msg.From, Type: "error", Body: "peer not found"})
+		log.Printf("no peer with id %s\n", msg.Body)
 		return
 	}
 
-	// 1. Reply to the requesting client who called this function
-	encoder := msgpack.NewEncoder(stream)
-	if err := encoder.Encode(Message{
-		From: "SERVER",
-		To:   msg.From,
-		Type: "request_ack",
-		Body: strings.Join([]string{peer.ID, peer.Conn.RemoteAddr().String()}, " "),
-	}); err != nil {
-		log.Printf("Failed sending request_ack to sender: %v", err)
+	you, ok := s.peers[msg.From]
+	if !ok {
+		log.Printf("no peer with id %s\n", msg.From)
+		return
 	}
 
-	s.mu.Lock()
-	you, _ := s.peers[msg.From]
-	s.mu.Unlock()
+	log.Printf("Matchmaking: Coordinating P2P hole punch between Client %s and Client %s\n", you.ID, peer.ID)
 
-	// 2. Alert the target peer asynchronously
+	// 3. Send target coordinates back to the Requesting Client (Client A)
+	// We explicitly include the target's PeerID so Client A can run the local tie-breaker math
+	encoder := msgpack.NewEncoder(stream)
+	err := encoder.Encode(Message{
+		Type: "request_ack",
+		From: "SERVER",
+		To:   msg.From, // 💡 Crucial for the client's ID tie-breaker logic
+		Body: strings.Join([]string{peer.ID, peer.Addr.String()}, " "),
+	})
+	if err != nil {
+		log.Printf("Failed sending coordinates to requester: %v\n", err)
+	}
+
+	// 4. Asynchronously open a new stream to inform the Target Client (Client B)
+	// This tells Client B to prepare its firewall for Client A's arrival
 	go func() {
 		pStream, err := peer.Conn.OpenStream()
 		if err != nil {
-			log.Printf("Failed to open stream to target peer: %v", err)
+			log.Printf("Failed to open background notification stream to target %s: %v\n", peer.ID)
 			return
 		}
-		// 💡 IMPORTANT: Using a separate scoped block ensures encoding
-		// happens completely before the stream defer closes.
+
 		enc := msgpack.NewEncoder(pStream)
 		err = enc.Encode(Message{
+			Type: "request_ack",
 			From: "SERVER",
 			To:   peer.ID,
-			Type: "request_ack",
-			Body: strings.Join([]string{you.ID, conn.RemoteAddr().String()}, " "),
+			Body: strings.Join([]string{you.ID, you.Addr.String()}, " "),
 		})
 		if err != nil {
-			log.Printf("Failed writing target info over stream: %v", err)
+			log.Printf("Failed writing coordinate payload to target stream: %v\n", err)
 		}
 
-		// Let QUIC finish sending data chunks before destroying the stream
 		pStream.Close()
 	}()
 }
