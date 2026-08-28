@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"hash/adler32"
 	"log"
-	"slices"
-	"strings"
+	"math/big"
 	"sync"
 	"time"
 
@@ -14,160 +18,108 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-type Server struct {
-	ID    string
-	peers map[string]*Peer
-	mu    sync.Mutex
+type PeerInfo struct {
+	ID   string `msgpack:"id"`
+	Addr string `msgpack:"a"`
 }
 
+type Message struct {
+	Type   string     `msgpack:"t"`
+	From   string     `msgpack:"f"`
+	Target string     `msgpack:"tg"` // 💡 THE FIX: Ensure this line exists in BOTH files
+	Data   string     `msgpack:"d"`
+	Role   string     `msgpack:"r"`
+	Peers  []PeerInfo `msgpack:"p"`
+}
+
+var activePeers sync.Map
+
 func main() {
-	ln, err := quic.ListenAddr("0.0.0.0:12345", GenerateTLSConfig(), &quic.Config{
-		MaxIdleTimeout: 2 * time.Hour,
-	})
+	ln, err := quic.ListenAddr("0.0.0.0:12345", generateTLS(), &quic.Config{MaxIdleTimeout: 2 * time.Hour})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer ln.Close()
+	log.Println("🚀 Automated Mesh Rendezvous Server running on port 12345...")
 
-	server := Server{peers: make(map[string]*Peer)}
 	for {
 		conn, err := ln.Accept(context.Background())
 		if err != nil {
-			log.Printf("quic accept error: %v\n", err)
 			continue
 		}
-
-		go server.handleClient(conn)
+		go handleClient(conn)
 	}
 }
 
-func (s *Server) handleClient(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "Connection closed")
-	clientAddrStr := conn.RemoteAddr().String()
+func handleClient(conn *quic.Conn) {
+	id := fmt.Sprint(adler32.Checksum([]byte(conn.RemoteAddr().String())))
+	myAddrStr := conn.RemoteAddr().String()
+
+	// 1. Gather a snapshot of all currently connected clients before storing ourselves
+	var currentFleet []PeerInfo
+	activePeers.Range(func(key, value any) bool {
+		peerID := key.(string)
+		peerConn := value.(*quic.Conn)
+		currentFleet = append(currentFleet, PeerInfo{ID: peerID, Addr: peerConn.RemoteAddr().String()})
+		return true
+	})
+
+	activePeers.Store(id, conn)
+	log.Printf("👥 Peer Registered: %s (%s)\n", id, myAddrStr)
+
+	defer func() {
+		activePeers.Delete(id)
+		conn.CloseWithError(0, "offline")
+		log.Printf("❌ Peer Offline: %s\n", id)
+	}()
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("quic stream accept error: %v\n", err)
 			return
 		}
 
 		go func(str *quic.Stream) {
 			defer str.Close()
-
-			msg := Message{}
-			decoder := msgpack.NewDecoder(stream)
-			if err := decoder.Decode(&msg); err != nil {
-				log.Printf("msgpack decode error: %v\n", err)
+			var msg Message
+			if err := msgpack.NewDecoder(str).Decode(&msg); err != nil {
 				return
 			}
 
-			log.Printf("%s sent: %v\n", clientAddrStr, msg)
+			if msg.Type == "hello" {
+				// Send them their assigned ID along with the entire current fleet roster
+				_ = msgpack.NewEncoder(str).Encode(Message{
+					Type:  "hello_ack",
+					Data:  id,
+					Peers: currentFleet,
+				})
 
-			switch msg.Type {
-			case "hello":
-				s.handleHello(str, conn)
-			case "request":
-				s.handleRequest(str, msg, conn)
-			case "goodbye": // 💡 ADD THIS CASE TO YOUR SERVER
-				s.mu.Lock()
-				delete(s.peers, msg.From) // Instantly clear the client from active pools
-				s.mu.Unlock()
-
-				s.broadcast(Message{From: "SERVER", To: "ALL", Type: "leave", Body: msg.From}, []string{})
+				// Broadcast a non-blocking alert to all existing clients to introduce the newcomer
+				activePeers.Range(func(key, value any) bool {
+					existingID := key.(string)
+					if existingID == id {
+						return true
+					}
+					existingConn := value.(*quic.Conn)
+					go func(pc *quic.Conn) {
+						tStr, err := pc.OpenStream()
+						if err != nil {
+							return
+						}
+						defer tStr.Close()
+						_ = msgpack.NewEncoder(tStr).Encode(Message{
+							Type: "connect_instruction", Data: myAddrStr, Target: id,
+						})
+					}(existingConn)
+					return true
+				})
 			}
-
 		}(stream)
 	}
 }
 
-func (s *Server) broadcast(msg Message, excludeIds []string) {
-	s.mu.Lock()
-	for peerId, peer := range s.peers {
-		if slices.Contains(excludeIds, peerId) {
-			continue
-		}
-
-		go func(pc *quic.Conn) {
-			pStream, err := pc.OpenStream()
-			if err != nil {
-				log.Printf("quic open stream error: %v\n", err)
-				return
-			}
-
-			defer pStream.Close()
-			_ = msgpack.NewEncoder(pStream).Encode(msg)
-		}(peer.Conn)
-	}
-	s.mu.Unlock()
-}
-
-func (s *Server) handleHello(stream *quic.Stream, conn *quic.Conn) {
-	// 💡 Read the connection tracking string directly out of conn context
-	// but use a hash of the raw string for the peer key map lookup
-	id := fmt.Sprint(adler32.Checksum([]byte(conn.RemoteAddr().String())))
-
-	s.mu.Lock()
-	// Save the connection context, but we will dynamically adjust the
-	// P2P routing table target to ensure it maps to the true external interface
-	s.peers[id] = &Peer{ID: id, Conn: conn, Addr: conn.RemoteAddr()}
-	s.mu.Unlock()
-
-	encoder := msgpack.NewEncoder(stream)
-	_ = encoder.Encode(Message{From: "SERVER", Type: "hello_ack", Body: id})
-	s.broadcast(Message{From: "SERVER", To: "ALL", Type: "join", Body: id}, []string{id})
-}
-
-func (s *Server) handleRequest(stream *quic.Stream, msg Message, conn *quic.Conn) {
-	s.mu.Lock()
-	peer, peerOk := s.peers[msg.Body]
-	you, youOk := s.peers[msg.From]
-	s.mu.Unlock()
-
-	if !peerOk {
-		log.Printf("no peer with id %s\n", msg.Body)
-		return
-	}
-	if !youOk {
-		log.Printf("no peer with id %s\n", msg.From)
-		return
-	}
-
-	log.Printf("Matchmaking: Coordinating P2P hole punch between Client %s and Client %s\n", you.ID, peer.ID)
-
-	// 3. Send target coordinates back to the Requesting Client (Client A)
-	// We explicitly include the target's PeerID so Client A can run the local tie-breaker math
-	encoder := msgpack.NewEncoder(stream)
-	err := encoder.Encode(Message{
-		Type: "request_ack",
-		From: "SERVER",
-		To:   msg.From, // 💡 Crucial for the client's ID tie-breaker logic
-		Body: strings.Join([]string{peer.ID, peer.Addr.String()}, " "),
-	})
-	if err != nil {
-		log.Printf("Failed sending coordinates to requester: %v\n", err)
-	}
-
-	// 4. Asynchronously open a new stream to inform the Target Client (Client B)
-	// This tells Client B to prepare its firewall for Client A's arrival
-	go func() {
-		pStream, err := peer.Conn.OpenStream()
-		if err != nil {
-			log.Printf("Failed to open background notification stream to target %s: %v\n", peer.ID)
-			return
-		}
-
-		enc := msgpack.NewEncoder(pStream)
-		err = enc.Encode(Message{
-			Type: "request_ack",
-			From: "SERVER",
-			To:   peer.ID,
-			Body: strings.Join([]string{you.ID, you.Addr.String()}, " "),
-		})
-		if err != nil {
-			log.Printf("Failed writing coordinate payload to target stream: %v\n", err)
-		}
-
-		pStream.Close()
-	}()
+func generateTLS() *tls.Config {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := x509.Certificate{SerialNumber: big.NewInt(1), KeyUsage: x509.KeyUsageDigitalSignature}
+	cert, _ := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{cert}, PrivateKey: key}}, NextProtos: []string{"p2p"}}
 }
